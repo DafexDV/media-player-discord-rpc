@@ -12,9 +12,20 @@ from pypresence.presence import Presence
 from pypresence.types import ActivityType
 
 
+class AssetNames(BaseModel):
+    elisa: str
+    vlc: str
+
+    def get(self, key: str, default: str | None) -> str | None:
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str) -> str:
+        return getattr(self, key)
+
+
 class Config(BaseModel):
     application_id: str
-    elisa_asset_name: str
+    asset_names: AssetNames
 
 
 class ConfigSerializer(ABC):
@@ -51,6 +62,16 @@ class JsonConfigSerializer(ConfigSerializer):
             f.write(raw)
 
 
+class NoMediaPlayerError(Exception):
+    pass
+
+
+SUPPORTED_MEDIA_PLAYER_MAP = {
+    "elisa": "org.mpris.MediaPlayer2.elisa",
+    "vlc": "org.mpris.MediaPlayer2.vlc",
+}
+SUPPORTED_MEDIA_PLAYERS = SUPPORTED_MEDIA_PLAYER_MAP.keys()
+
 CONFIG_DIR = Path.home() / ".config" / "mp_discord_rpc"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 SHARE_DIR = Path.home() / ".local" / "share" / "mp_discord_rpc"
@@ -63,7 +84,7 @@ DEFAULT_CONFIG = Config(
     # passing its id to the script config file
     # ~/.config/mp_discord_rpc/config.json
     application_id="1544121036658704464",
-    elisa_asset_name="elisa",
+    asset_names=AssetNames(elisa="elisa", vlc="vlc"),
 )
 
 
@@ -130,7 +151,7 @@ class Application:
             try:
                 presence.connect()
             except (FileNotFoundError, ConnectionRefusedError):
-                self.logger.error(
+                self.logger.warning(
                     "Failed to connect to RPC. Do you have discord running?"
                 )
                 time.sleep(5)
@@ -144,54 +165,81 @@ class Application:
         bus = dbus.SessionBus()
         already_stopped = True
 
-        # Second loop: get elisa dbus data
+        # Second loop: get mp dbus data
         while True:
-            self.logger.debug("Getting data from Elisa...")
+            self.logger.debug("Updating media player information...")
             try:
-                track_name, track_artist, playback_status = (
-                    self._extract_data_from_elisa(bus)
+                mp_key, track_name, track_artist, playback_status = (
+                    self._extract_data_from_mp(bus)
                 )
-            except dbus.DBusException:
-                self.logger.error(
-                    "Failed to get elisa information. Do you have Elisa running?"
+                self.logger.debug(
+                    "mp_key = %s; track_name = %s; track_artist = %s; playback_status = %s",
+                    mp_key,
+                    track_name,
+                    track_artist,
+                    playback_status,
                 )
+            except NoMediaPlayerError:
+                self.logger.debug("No supported media player is currently running")
+                time.sleep(5)
                 continue
+            except dbus.DBusException:
+                self.logger.warning("Failed to communicate with the D-Bus media player")
+                time.sleep(5)
+                continue
+
+            asset_name = self.config.asset_names.get(mp_key, None)
 
             # Update discord rpc activity
             if playback_status == "Playing":
                 already_stopped = False
                 presence.update(
                     activity_type=ActivityType.LISTENING,
-                    large_image="elisa",
+                    large_image=asset_name,
                     details=track_name,
                     state=track_artist,
+                )
+                self.logger.info(
+                    "Updated Discord RPC: player=%s, title=%r",
+                    mp_key,
+                    track_name,
                 )
                 time.sleep(5)
             elif playback_status == "Stopped":
                 if not already_stopped:
                     presence.update(
                         activity_type=ActivityType.LISTENING,
-                        large_image="elisa",
+                        large_image=asset_name,
                         details=track_name,
                         state=track_artist,
+                    )
+                    self.logger.info(
+                        "Updated Discord RPC: player=%s, title=%r",
+                        mp_key,
+                        track_name,
                     )
                     already_stopped = True
                 time.sleep(5)
                 while True:
                     try:
                         presence.clear()
+                        self.logger.info("Cleared Discord RPC activity")
                     except (ConnectionRefusedError, pyexp.InvalidID):
-                        self.logger.error("Connection reset, retrying connection")
+                        self.logger.info("Connection reset, retrying connection")
                         # This handles error just in case Discord still hasn't turned on
                         while True:
                             try:
                                 presence.connect()
                             except (FileNotFoundError, ConnectionRefusedError):
-                                self.logger.error(
+                                self.logger.warning(
                                     "Could not connect to RPC. Do you have discord running?"
                                 )
                                 time.sleep(5)
                             else:
+                                self.logger.info(
+                                    "Connected to discord successfully (application_id=(%s)",
+                                    presence.client_id,
+                                )
                                 break
                         time.sleep(5)
                     else:
@@ -200,28 +248,44 @@ class Application:
                 while True:
                     try:
                         presence.clear()
+                        self.logger.info("Cleared Discord RPC activity")
                     except (ConnectionRefusedError, pyexp.InvalidID):
-                        self.logger.error("Connection reset, retrying connection")
+                        self.logger.info("Connection reset, retrying connection")
                         # This handles error just in case Discord still hasn't turned on
                         while True:
                             try:
                                 presence.connect()
                             except (FileNotFoundError, ConnectionRefusedError):
-                                self.logger.error(
+                                self.logger.warning(
                                     "Could not connect to RPC. Do you have discord running?"
                                 )
                                 time.sleep(5)
                             else:
+                                self.logger.info(
+                                    "Connected to discord successfully (application_id=(%s)",
+                                    presence.client_id,
+                                )
                                 break
                         time.sleep(5)
                     else:
+                        time.sleep(5)
                         break
-                time.sleep(5)
 
-    def _extract_data_from_elisa(self, bus: dbus.SessionBus) -> tuple[str, str, str]:
-        proxy = bus.get_object(
-            "org.mpris.MediaPlayer2.elisa", "/org/mpris/MediaPlayer2"
-        )
+    def _extract_data_from_mp(self, bus: dbus.SessionBus) -> tuple[str, str, str, str]:
+        mp_key: str | None = None
+        proxy: dbus.SessionBus.ProxyObjectClass | None = None
+        for c_mp_key in SUPPORTED_MEDIA_PLAYERS:
+            try:
+                proxy = bus.get_object(
+                    SUPPORTED_MEDIA_PLAYER_MAP[c_mp_key], "/org/mpris/MediaPlayer2"
+                )
+                mp_key = c_mp_key
+                break
+            except dbus.DBusException:
+                continue
+
+        if mp_key is None or proxy is None:
+            raise NoMediaPlayerError("No supported media player is running")
 
         props = dbus.Interface(proxy, dbus_interface="org.freedesktop.DBus.Properties")
 
@@ -243,7 +307,7 @@ class Application:
         if track_artists:
             track_artist = ", ".join(track_artists)
 
-        return (str(track_name), str(track_artist), str(playback_status))
+        return (mp_key, str(track_name), str(track_artist), str(playback_status))
 
 
 def main():
