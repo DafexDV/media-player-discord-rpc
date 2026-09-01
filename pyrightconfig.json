@@ -1,0 +1,9 @@
+{
+  "reportAny": "none",
+  "reportUnusedCallResult": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownVariableType": "none",
+  "reportOperatorIssue": "none",
+  "reportMissingTypeStubs": "none",
+}
